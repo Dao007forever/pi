@@ -31,17 +31,13 @@ import { type GitSource, parseGitUrl } from "../utils/git.ts";
 import { canonicalizePath, isLocalPath, markPathIgnoredByCloudSync, resolvePath } from "../utils/paths.ts";
 import { stripBom } from "../utils/text.ts";
 import { isStdoutTakenOver } from "./output-guard.ts";
-import { type PiManifest, readPiManifest } from "./pi-manifest.ts";
 import {
-	applyAutoloadDisabledPatterns,
-	applyPatterns,
-	discoverTopLevelResources,
 	isEnabledByOverrides,
+	type PackageResourceFilter,
 	type ResourceType,
-	resolveManifestResources,
-	resolveResourceDirectory,
-	resolveResourcePaths,
-	splitPatterns,
+	resolveConfiguredResources,
+	resolvePackageResources,
+	resolveResourcesInDirectory,
 } from "./resource-resolver.ts";
 import type { PackageSource, SettingsManager } from "./settings-manager.ts";
 
@@ -188,14 +184,6 @@ function resourcePrecedenceRank(m: PathMetadata): number {
 	if (m.origin === "package") return 4;
 	const scopeBase = m.scope === "project" ? 0 : 2;
 	return scopeBase + (m.source === "local" ? 0 : 1);
-}
-
-interface PackageFilter {
-	autoload?: boolean;
-	extensions?: string[];
-	skills?: string[];
-	prompts?: string[];
-	themes?: string[];
 }
 
 const RESOURCE_TYPES: ResourceType[] = ["extensions", "skills", "prompts", "themes"];
@@ -734,7 +722,7 @@ export class DefaultPackageManager implements PackageManager {
 					installedPath = this.getNpmInstallPath(parsed, resolvedScope);
 				}
 				metadata.baseDir = installedPath;
-				this.collectPackageResources(installedPath, accumulator, filter, metadata);
+				this.addPackageResources(installedPath, accumulator, filter, metadata);
 				continue;
 			}
 
@@ -747,7 +735,7 @@ export class DefaultPackageManager implements PackageManager {
 					await this.refreshTemporaryGitSource(parsed, resolvedSource);
 				}
 				metadata.baseDir = installedPath;
-				this.collectPackageResources(installedPath, accumulator, filter, metadata);
+				this.addPackageResources(installedPath, accumulator, filter, metadata);
 			}
 		}
 	}
@@ -770,7 +758,7 @@ export class DefaultPackageManager implements PackageManager {
 	private resolveLocalExtensionSource(
 		source: LocalSource,
 		accumulator: ResourceAccumulator,
-		filter: PackageFilter | undefined,
+		filter: PackageResourceFilter | undefined,
 		metadata: PathMetadata,
 		baseDir: string,
 	): void {
@@ -788,7 +776,7 @@ export class DefaultPackageManager implements PackageManager {
 			}
 			if (stats.isDirectory()) {
 				metadata.baseDir = resolved;
-				const resources = this.collectPackageResources(resolved, accumulator, filter, metadata);
+				const resources = this.addPackageResources(resolved, accumulator, filter, metadata);
 				if (!resources) {
 					this.addResource(accumulator.extensions, resolved, metadata, true);
 				}
@@ -1593,150 +1581,20 @@ export class DefaultPackageManager implements PackageManager {
 		return resolvePath(input, baseDir, { homeDir: getHomeDir(), trim: true });
 	}
 
-	private collectPackageResources(
+	private addPackageResources(
 		packageRoot: string,
 		accumulator: ResourceAccumulator,
-		filter: PackageFilter | undefined,
+		filter: PackageResourceFilter | undefined,
 		metadata: PathMetadata,
 	): boolean {
-		if (filter) {
-			for (const resourceType of RESOURCE_TYPES) {
-				const patterns = filter[resourceType];
-				const target = this.getTargetMap(accumulator, resourceType);
-				if (filter.autoload === false) {
-					this.applyPackageDeltaFilter(packageRoot, patterns ?? [], resourceType, target, metadata);
-				} else if (patterns !== undefined) {
-					this.applyPackageFilter(packageRoot, patterns, resourceType, target, metadata);
-				} else {
-					this.collectDefaultResources(packageRoot, resourceType, target, metadata);
-				}
-			}
-			return true;
-		}
-
-		const manifest = readPiManifest(join(packageRoot, "package.json"));
-		if (manifest) {
-			for (const resourceType of RESOURCE_TYPES) {
-				const entries = manifest[resourceType as keyof PiManifest];
-				this.addManifestEntries(
-					entries,
-					packageRoot,
-					resourceType,
-					this.getTargetMap(accumulator, resourceType),
-					metadata,
-				);
-			}
-			return true;
-		}
-
-		let hasAnyDir = false;
+		const resolution = resolvePackageResources(packageRoot, filter);
 		for (const resourceType of RESOURCE_TYPES) {
-			const dir = join(packageRoot, resourceType);
-			if (existsSync(dir)) {
-				// Resolve the convention directory (all resources enabled by default)
-				const files = resolveResourceDirectory(dir, resourceType);
-				for (const f of files) {
-					this.addResource(this.getTargetMap(accumulator, resourceType), f, metadata, true);
-				}
-				hasAnyDir = true;
+			const target = this.getTargetMap(accumulator, resourceType);
+			for (const [path, enabled] of resolution.resources[resourceType]) {
+				this.addResource(target, path, metadata, enabled);
 			}
 		}
-		return hasAnyDir;
-	}
-
-	private collectDefaultResources(
-		packageRoot: string,
-		resourceType: ResourceType,
-		target: Map<string, { metadata: PathMetadata; enabled: boolean }>,
-		metadata: PathMetadata,
-	): void {
-		const manifest = readPiManifest(join(packageRoot, "package.json"));
-		const entries = manifest?.[resourceType as keyof PiManifest];
-		if (entries) {
-			this.addManifestEntries(entries, packageRoot, resourceType, target, metadata);
-			return;
-		}
-		const dir = join(packageRoot, resourceType);
-		if (existsSync(dir)) {
-			// Resolve the convention directory (all resources enabled by default)
-			const files = resolveResourceDirectory(dir, resourceType);
-			for (const f of files) {
-				this.addResource(target, f, metadata, true);
-			}
-		}
-	}
-
-	private applyPackageFilter(
-		packageRoot: string,
-		userPatterns: string[],
-		resourceType: ResourceType,
-		target: Map<string, { metadata: PathMetadata; enabled: boolean }>,
-		metadata: PathMetadata,
-	): void {
-		const allFiles = this.collectManifestFiles(packageRoot, resourceType);
-
-		if (userPatterns.length === 0) {
-			// Empty array explicitly disables all resources of this type
-			for (const f of allFiles) {
-				this.addResource(target, f, metadata, false);
-			}
-			return;
-		}
-
-		// Apply user patterns
-		const enabledByUser = applyPatterns(allFiles, userPatterns, packageRoot);
-
-		for (const f of allFiles) {
-			const enabled = enabledByUser.has(f);
-			this.addResource(target, f, metadata, enabled);
-		}
-	}
-
-	private applyPackageDeltaFilter(
-		packageRoot: string,
-		userPatterns: string[],
-		resourceType: ResourceType,
-		target: Map<string, { metadata: PathMetadata; enabled: boolean }>,
-		metadata: PathMetadata,
-	): void {
-		if (userPatterns.length === 0) {
-			return;
-		}
-
-		const allFiles = this.collectManifestFiles(packageRoot, resourceType);
-		const enabledByUser = applyAutoloadDisabledPatterns(allFiles, userPatterns, packageRoot);
-		for (const [filePath, enabled] of enabledByUser) {
-			this.addResource(target, filePath, metadata, enabled);
-		}
-	}
-
-	/** Collect all files allowed by a package manifest or its convention directory. */
-	private collectManifestFiles(packageRoot: string, resourceType: ResourceType): string[] {
-		const manifest = readPiManifest(join(packageRoot, "package.json"));
-		const entries = manifest?.[resourceType as keyof PiManifest];
-		if (entries !== undefined) {
-			return resolveManifestResources(entries, packageRoot, resourceType);
-		}
-
-		const conventionDir = join(packageRoot, resourceType);
-		if (!existsSync(conventionDir)) {
-			return [];
-		}
-		return resolveResourceDirectory(conventionDir, resourceType);
-	}
-
-	private addManifestEntries(
-		entries: string[] | undefined,
-		root: string,
-		resourceType: ResourceType,
-		target: Map<string, { metadata: PathMetadata; enabled: boolean }>,
-		metadata: PathMetadata,
-	): void {
-		if (!entries) return;
-
-		for (const file of resolveManifestResources(entries, root, resourceType)) {
-			this.addResource(target, file, metadata, true);
-		}
+		return resolution.handled;
 	}
 
 	private resolveLocalEntries(
@@ -1748,17 +1606,11 @@ export class DefaultPackageManager implements PackageManager {
 	): void {
 		if (entries.length === 0) return;
 
-		// Resolve resources from plain entries (non-pattern entries)
-		const { plain, patterns } = splitPatterns(entries);
-		const resolvedPlain = plain.map((p) => this.resolvePathFromBase(p, baseDir));
-		const allFiles = resolveResourcePaths(resolvedPlain, resourceType);
-
-		// Determine which files are enabled based on patterns
-		const enabledPaths = applyPatterns(allFiles, patterns, baseDir);
-
-		// Add all files with their enabled state
-		for (const f of allFiles) {
-			this.addResource(target, f, metadata, enabledPaths.has(f));
+		const resources = resolveConfiguredResources(entries, resourceType, baseDir, (entry) =>
+			this.resolvePathFromBase(entry, baseDir),
+		);
+		for (const [path, enabled] of resources) {
+			this.addResource(target, path, metadata, enabled);
 		}
 	}
 
@@ -1831,7 +1683,7 @@ export class DefaultPackageManager implements PackageManager {
 			// Project extensions from .pi/
 			addResources(
 				"extensions",
-				discoverTopLevelResources(projectDirs.extensions, "extensions"),
+				resolveResourcesInDirectory(projectDirs.extensions, "extensions"),
 				projectMetadata,
 				projectOverrides.extensions,
 				projectBaseDir,
@@ -1840,7 +1692,7 @@ export class DefaultPackageManager implements PackageManager {
 			// Project skills from .pi/
 			addResources(
 				"skills",
-				discoverTopLevelResources(projectDirs.skills, "skills", "pi"),
+				resolveResourcesInDirectory(projectDirs.skills, "skills"),
 				projectMetadata,
 				projectOverrides.skills,
 				projectBaseDir,
@@ -1856,7 +1708,7 @@ export class DefaultPackageManager implements PackageManager {
 			};
 			addResources(
 				"skills",
-				discoverTopLevelResources(agentsSkillsDir, "skills", "agents"),
+				resolveResourcesInDirectory(agentsSkillsDir, "skills", { skillMode: "agents" }),
 				agentsMetadata,
 				projectOverrides.skills,
 				agentsBaseDir,
@@ -1866,14 +1718,14 @@ export class DefaultPackageManager implements PackageManager {
 		if (projectTrusted) {
 			addResources(
 				"prompts",
-				discoverTopLevelResources(projectDirs.prompts, "prompts"),
+				resolveResourcesInDirectory(projectDirs.prompts, "prompts"),
 				projectMetadata,
 				projectOverrides.prompts,
 				projectBaseDir,
 			);
 			addResources(
 				"themes",
-				discoverTopLevelResources(projectDirs.themes, "themes"),
+				resolveResourcesInDirectory(projectDirs.themes, "themes"),
 				projectMetadata,
 				projectOverrides.themes,
 				projectBaseDir,
@@ -1883,7 +1735,7 @@ export class DefaultPackageManager implements PackageManager {
 		// User extensions from ~/.pi/agent/
 		addResources(
 			"extensions",
-			discoverTopLevelResources(userDirs.extensions, "extensions"),
+			resolveResourcesInDirectory(userDirs.extensions, "extensions"),
 			userMetadata,
 			userOverrides.extensions,
 			globalBaseDir,
@@ -1892,7 +1744,7 @@ export class DefaultPackageManager implements PackageManager {
 		// User skills from ~/.pi/agent/
 		addResources(
 			"skills",
-			discoverTopLevelResources(userDirs.skills, "skills", "pi"),
+			resolveResourcesInDirectory(userDirs.skills, "skills"),
 			userMetadata,
 			userOverrides.skills,
 			globalBaseDir,
@@ -1906,7 +1758,7 @@ export class DefaultPackageManager implements PackageManager {
 		};
 		addResources(
 			"skills",
-			discoverTopLevelResources(userAgentsSkillsDir, "skills", "agents"),
+			resolveResourcesInDirectory(userAgentsSkillsDir, "skills", { skillMode: "agents" }),
 			userAgentsMetadata,
 			userOverrides.skills,
 			userAgentsBaseDir,
@@ -1914,14 +1766,14 @@ export class DefaultPackageManager implements PackageManager {
 
 		addResources(
 			"prompts",
-			discoverTopLevelResources(userDirs.prompts, "prompts"),
+			resolveResourcesInDirectory(userDirs.prompts, "prompts"),
 			userMetadata,
 			userOverrides.prompts,
 			globalBaseDir,
 		);
 		addResources(
 			"themes",
-			discoverTopLevelResources(userDirs.themes, "themes"),
+			resolveResourcesInDirectory(userDirs.themes, "themes"),
 			userMetadata,
 			userOverrides.themes,
 			globalBaseDir,

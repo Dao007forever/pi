@@ -15,7 +15,7 @@ import { resolvePath } from "../../utils/paths.ts";
 import { createEventBus, type EventBus } from "../event-bus.ts";
 import type { ExecOptions } from "../exec.ts";
 import { execCommand } from "../exec.ts";
-import { discoverTopLevelResources } from "../resource-resolver.ts";
+import { resolveResourcesInDirectory } from "../resource-resolver.ts";
 import { createSyntheticSourceInfo } from "../source-info.ts";
 import { time } from "../timings.ts";
 import type {
@@ -680,17 +680,17 @@ export async function discoverAndLoadExtensions(
 
 	// 1. Project-local extensions: cwd/${CONFIG_DIR_NAME}/extensions/
 	const localExtDir = path.join(resolvedCwd, CONFIG_DIR_NAME, "extensions");
-	addPaths(discoverTopLevelResources(localExtDir, "extensions"));
+	addPaths(resolveResourcesInDirectory(localExtDir, "extensions"));
 
 	// 2. Global extensions: agentDir/extensions/
 	const globalExtDir = path.join(resolvedAgentDir, "extensions");
-	addPaths(discoverTopLevelResources(globalExtDir, "extensions"));
+	addPaths(resolveResourcesInDirectory(globalExtDir, "extensions"));
 
 	// 3. Explicitly configured paths
 	for (const p of configuredPaths) {
 		const resolved = resolvePath(p, resolvedCwd, { normalizeUnicodeSpaces: true });
 		if (fs.existsSync(resolved) && fs.statSync(resolved).isDirectory()) {
-			addPaths(discoverTopLevelResources(resolved, "extensions"));
+			addPaths(resolveResourcesInDirectory(resolved, "extensions"));
 			continue;
 		}
 

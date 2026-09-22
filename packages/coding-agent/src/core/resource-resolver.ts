@@ -4,15 +4,22 @@ import ignore from "ignore";
 import { minimatch } from "minimatch";
 import { readPiManifest } from "./pi-manifest.ts";
 
-export type ResourceType = "extensions" | "skills" | "prompts" | "themes";
-type SkillDiscoveryMode = "pi" | "agents";
+const RESOURCE_TYPES = ["extensions", "skills", "prompts", "themes"] as const;
+export type ResourceType = (typeof RESOURCE_TYPES)[number];
+export interface PackageResourceFilter {
+	autoload?: boolean;
+	extensions?: string[];
+	skills?: string[];
+	prompts?: string[];
+	themes?: string[];
+}
 
-const FILE_PATTERNS: Record<ResourceType, RegExp> = {
-	extensions: /\.(ts|js)$/,
-	skills: /\.md$/,
-	prompts: /\.md$/,
-	themes: /\.json$/,
-};
+export interface PackageResourceResolution {
+	handled: boolean;
+	resources: Record<ResourceType, Map<string, boolean>>;
+}
+
+type SkillDiscoveryMode = "pi" | "agents";
 
 const IGNORE_FILE_NAMES = [".gitignore", ".ignore", ".fdignore"];
 
@@ -65,22 +72,17 @@ function addIgnoreRules(ig: IgnoreMatcher, dir: string, rootDir: string): void {
 	}
 }
 
-function isPattern(value: string): boolean {
-	return (
-		value.startsWith("!") ||
-		value.startsWith("+") ||
-		value.startsWith("-") ||
-		value.includes("*") ||
-		value.includes("?")
-	);
-}
+type ResourceRule =
+	| { kind: "source"; value: string; isGlob: boolean }
+	| { kind: "exclude"; value: string }
+	| { kind: "force-include"; value: string }
+	| { kind: "force-exclude"; value: string };
 
-function isOverridePattern(value: string): boolean {
-	return value.startsWith("!") || value.startsWith("+") || value.startsWith("-");
-}
-
-function hasGlobPattern(value: string): boolean {
-	return value.includes("*") || value.includes("?");
+function parseResourceRule(entry: string): ResourceRule {
+	if (entry.startsWith("!")) return { kind: "exclude", value: entry.slice(1) };
+	if (entry.startsWith("+")) return { kind: "force-include", value: entry.slice(1) };
+	if (entry.startsWith("-")) return { kind: "force-exclude", value: entry.slice(1) };
+	return { kind: "source", value: entry, isGlob: entry.includes("*") || entry.includes("?") };
 }
 
 function normalizePattern(pattern: string): string {
@@ -100,22 +102,10 @@ function expandPackageGlob(pattern: string, root: string): string[] {
 		.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
 }
 
-export function splitPatterns(entries: string[]): { plain: string[]; patterns: string[] } {
-	const plain: string[] = [];
-	const patterns: string[] = [];
-	for (const entry of entries) {
-		if (isPattern(entry)) {
-			patterns.push(entry);
-		} else {
-			plain.push(entry);
-		}
-	}
-	return { plain, patterns };
-}
-
-function discoverFilesRecursively(
+function discoverFiles(
 	dir: string,
 	filePattern: RegExp,
+	recursive: boolean,
 	skipNodeModules = true,
 	ignoreMatcher?: IgnoreMatcher,
 	rootDir?: string,
@@ -151,8 +141,8 @@ function discoverFilesRecursively(
 			const ignorePath = isDir ? `${relPath}/` : relPath;
 			if (ig.ignores(ignorePath)) continue;
 
-			if (isDir) {
-				files.push(...discoverFilesRecursively(fullPath, filePattern, skipNodeModules, ig, root));
+			if (isDir && recursive) {
+				files.push(...discoverFiles(fullPath, filePattern, true, skipNodeModules, ig, root));
 			} else if (isFile && filePattern.test(entry.name)) {
 				files.push(fullPath);
 			}
@@ -243,80 +233,6 @@ function discoverSkills(
 	return entries;
 }
 
-function discoverTopLevelPromptResources(dir: string): string[] {
-	const entries: string[] = [];
-	if (!existsSync(dir)) return entries;
-
-	const ig = ignore();
-	addIgnoreRules(ig, dir, dir);
-
-	try {
-		const dirEntries = readdirSync(dir, { withFileTypes: true });
-		for (const entry of dirEntries) {
-			if (entry.name.startsWith(".")) continue;
-			if (entry.name === "node_modules") continue;
-
-			const fullPath = join(dir, entry.name);
-			let isFile = entry.isFile();
-			if (entry.isSymbolicLink()) {
-				try {
-					isFile = statSync(fullPath).isFile();
-				} catch {
-					continue;
-				}
-			}
-
-			const relPath = toPosixPath(relative(dir, fullPath));
-			if (ig.ignores(relPath)) continue;
-
-			if (isFile && entry.name.endsWith(".md")) {
-				entries.push(fullPath);
-			}
-		}
-	} catch {
-		// Ignore errors
-	}
-
-	return entries;
-}
-
-function discoverTopLevelThemeResources(dir: string): string[] {
-	const entries: string[] = [];
-	if (!existsSync(dir)) return entries;
-
-	const ig = ignore();
-	addIgnoreRules(ig, dir, dir);
-
-	try {
-		const dirEntries = readdirSync(dir, { withFileTypes: true });
-		for (const entry of dirEntries) {
-			if (entry.name.startsWith(".")) continue;
-			if (entry.name === "node_modules") continue;
-
-			const fullPath = join(dir, entry.name);
-			let isFile = entry.isFile();
-			if (entry.isSymbolicLink()) {
-				try {
-					isFile = statSync(fullPath).isFile();
-				} catch {
-					continue;
-				}
-			}
-
-			const relPath = toPosixPath(relative(dir, fullPath));
-			if (ig.ignores(relPath)) continue;
-
-			if (isFile && entry.name.endsWith(".json")) {
-				entries.push(fullPath);
-			}
-		}
-	} catch {
-		// Ignore errors
-	}
-
-	return entries;
-}
-
 function resolveExtensionEntries(dir: string): string[] | null {
 	const manifest = readPiManifest(join(dir, "package.json"));
 	if (manifest?.extensions !== undefined) {
@@ -364,7 +280,7 @@ function discoverExtensionDirectoryContents(dir: string): string[] {
 			const ignorePath = isDir ? `${relPath}/` : relPath;
 			if (ig.ignores(ignorePath)) continue;
 
-			if (isFile && FILE_PATTERNS.extensions.test(entry.name)) {
+			if (isFile && /\.(ts|js)$/.test(entry.name)) {
 				entries.push(fullPath);
 			} else if (isDir) {
 				const resolvedEntries = resolveExtensionEntries(fullPath);
@@ -391,36 +307,24 @@ function discoverExtensionResources(dir: string): string[] {
 	return discoverExtensionDirectoryContents(dir);
 }
 
-/** Resolve a directory entry using the resource type's package convention. */
-export function resolveResourceDirectory(dir: string, resourceType: ResourceType): string[] {
-	if (resourceType === "skills") {
-		return discoverSkills(dir, "pi");
-	}
-	if (resourceType === "extensions") {
-		return discoverExtensionResources(dir);
-	}
-	return discoverFilesRecursively(dir, FILE_PATTERNS[resourceType]);
-}
-
-/** Discover resources from a coding-agent configuration directory. */
-export function discoverTopLevelResources(
+export function resolveResourcesInDirectory(
 	dir: string,
 	resourceType: ResourceType,
-	skillMode: SkillDiscoveryMode = "pi",
+	options: { recursive?: boolean; skillMode?: "pi" | "agents" } = {},
 ): string[] {
-	if (resourceType === "skills") {
-		return discoverSkills(dir, skillMode);
+	switch (resourceType) {
+		case "extensions":
+			return discoverExtensionResources(dir);
+		case "skills":
+			return discoverSkills(dir, options.skillMode ?? "pi");
+		case "prompts":
+			return discoverFiles(dir, /\.md$/, options.recursive ?? false);
+		case "themes":
+			return discoverFiles(dir, /\.json$/, options.recursive ?? false);
 	}
-	if (resourceType === "extensions") {
-		return discoverExtensionResources(dir);
-	}
-	if (resourceType === "prompts") {
-		return discoverTopLevelPromptResources(dir);
-	}
-	return discoverTopLevelThemeResources(dir);
 }
 
-function matchesAnyPattern(filePath: string, patterns: string[], baseDir: string): boolean {
+function matchesAnyPattern(filePath: string, rules: ResourceRule[], baseDir: string): boolean {
 	const rel = toPosixPath(relative(baseDir, filePath));
 	const name = basename(filePath);
 	const filePathPosix = toPosixPath(filePath);
@@ -430,8 +334,8 @@ function matchesAnyPattern(filePath: string, patterns: string[], baseDir: string
 	const parentName = isSkillFile ? basename(parentDir!) : undefined;
 	const parentDirPosix = isSkillFile ? toPosixPath(parentDir!) : undefined;
 
-	return patterns.some((pattern) => {
-		const normalizedPattern = normalizePattern(pattern);
+	return rules.some((rule) => {
+		const normalizedPattern = normalizePattern(rule.value);
 		if (
 			minimatch(rel, normalizedPattern) ||
 			minimatch(name, normalizedPattern) ||
@@ -448,8 +352,8 @@ function matchesAnyPattern(filePath: string, patterns: string[], baseDir: string
 	});
 }
 
-function matchesAnyExactPattern(filePath: string, patterns: string[], baseDir: string): boolean {
-	if (patterns.length === 0) return false;
+function matchesAnyExactPattern(filePath: string, rules: ResourceRule[], baseDir: string): boolean {
+	if (rules.length === 0) return false;
 	const rel = toPosixPath(relative(baseDir, filePath));
 	const name = basename(filePath);
 	const filePathPosix = toPosixPath(filePath);
@@ -458,8 +362,8 @@ function matchesAnyExactPattern(filePath: string, patterns: string[], baseDir: s
 	const parentRel = isSkillFile ? toPosixPath(relative(baseDir, parentDir!)) : undefined;
 	const parentDirPosix = isSkillFile ? toPosixPath(parentDir!) : undefined;
 
-	return patterns.some((pattern) => {
-		const normalized = normalizePattern(pattern);
+	return rules.some((rule) => {
+		const normalized = normalizePattern(rule.value);
 		if (normalized === rel || normalized === filePathPosix) {
 			return true;
 		}
@@ -468,47 +372,16 @@ function matchesAnyExactPattern(filePath: string, patterns: string[], baseDir: s
 	});
 }
 
-function getOverridePatterns(entries: string[]): string[] {
-	return entries.filter(isOverridePattern);
-}
-
 export function isEnabledByOverrides(filePath: string, patterns: string[], baseDir: string): boolean {
-	const overrides = getOverridePatterns(patterns);
-	const excludes = overrides.filter((pattern) => pattern.startsWith("!")).map((pattern) => pattern.slice(1));
-	const forceIncludes = overrides.filter((pattern) => pattern.startsWith("+")).map((pattern) => pattern.slice(1));
-	const forceExcludes = overrides.filter((pattern) => pattern.startsWith("-")).map((pattern) => pattern.slice(1));
-
-	let enabled = true;
-	if (excludes.length > 0 && matchesAnyPattern(filePath, excludes, baseDir)) {
-		enabled = false;
-	}
-	if (forceIncludes.length > 0 && matchesAnyExactPattern(filePath, forceIncludes, baseDir)) {
-		enabled = true;
-	}
-	if (forceExcludes.length > 0 && matchesAnyExactPattern(filePath, forceExcludes, baseDir)) {
-		enabled = false;
-	}
-	return enabled;
+	const rules = patterns.map(parseResourceRule).filter((rule) => rule.kind !== "source");
+	return selectResourcePaths([filePath], rules, baseDir).has(filePath);
 }
 
-/** Apply include, exclude, force-include, and force-exclude patterns to resource paths. */
-export function applyPatterns(allPaths: string[], patterns: string[], baseDir: string): Set<string> {
-	const includes: string[] = [];
-	const excludes: string[] = [];
-	const forceIncludes: string[] = [];
-	const forceExcludes: string[] = [];
-
-	for (const pattern of patterns) {
-		if (pattern.startsWith("+")) {
-			forceIncludes.push(pattern.slice(1));
-		} else if (pattern.startsWith("-")) {
-			forceExcludes.push(pattern.slice(1));
-		} else if (pattern.startsWith("!")) {
-			excludes.push(pattern.slice(1));
-		} else {
-			includes.push(pattern);
-		}
-	}
+function selectResourcePaths(allPaths: string[], rules: ResourceRule[], baseDir: string): Set<string> {
+	const includes = rules.filter((rule) => rule.kind === "source");
+	const excludes = rules.filter((rule) => rule.kind === "exclude");
+	const forceIncludes = rules.filter((rule) => rule.kind === "force-include");
+	const forceExcludes = rules.filter((rule) => rule.kind === "force-exclude");
 
 	let result =
 		includes.length === 0
@@ -534,22 +407,22 @@ export function applyPatterns(allPaths: string[], patterns: string[], baseDir: s
 	return new Set(result);
 }
 
-export function applyAutoloadDisabledPatterns(
+function resolveResourceFilter(allPaths: string[], patterns: string[], baseDir: string): Map<string, boolean> {
+	const enabledPaths = selectResourcePaths(allPaths, patterns.map(parseResourceRule), baseDir);
+	return new Map(allPaths.map((path) => [path, enabledPaths.has(path)]));
+}
+
+function resolveAutoloadDisabledResources(
 	allPaths: string[],
 	patterns: string[],
 	baseDir: string,
 ): Map<string, boolean> {
 	const result = new Map<string, boolean>();
-	for (const pattern of patterns) {
-		const target = pattern.slice(
-			pattern.startsWith("+") || pattern.startsWith("-") || pattern.startsWith("!") ? 1 : 0,
-		);
-		const enabled = !pattern.startsWith("-") && !pattern.startsWith("!");
-		const exact = pattern.startsWith("+") || pattern.startsWith("-");
+	for (const rule of patterns.map(parseResourceRule)) {
+		const enabled = rule.kind === "source" || rule.kind === "force-include";
+		const exact = rule.kind === "force-include" || rule.kind === "force-exclude";
 		for (const filePath of allPaths) {
-			if (
-				exact ? matchesAnyExactPattern(filePath, [target], baseDir) : matchesAnyPattern(filePath, [target], baseDir)
-			) {
+			if (exact ? matchesAnyExactPattern(filePath, [rule], baseDir) : matchesAnyPattern(filePath, [rule], baseDir)) {
 				result.set(filePath, enabled);
 			}
 		}
@@ -557,7 +430,7 @@ export function applyAutoloadDisabledPatterns(
 	return result;
 }
 
-export function resolveResourcePaths(paths: string[], resourceType: ResourceType, manifestRoot?: string): string[] {
+function resolveResourcePaths(paths: string[], resourceType: ResourceType, manifestRoot?: string): string[] {
 	const files: string[] = [];
 	const resolvedManifestRoot = manifestRoot ? resolve(manifestRoot) : undefined;
 	for (const path of paths) {
@@ -571,7 +444,7 @@ export function resolveResourcePaths(paths: string[], resourceType: ResourceType
 				if (resourceType === "extensions" && resolvedManifestRoot === resolve(path)) {
 					files.push(...discoverExtensionDirectoryContents(path));
 				} else {
-					files.push(...resolveResourceDirectory(path, resourceType));
+					files.push(...resolveResourcesInDirectory(path, resourceType, { recursive: true }));
 				}
 			}
 		} catch {
@@ -581,15 +454,118 @@ export function resolveResourcePaths(paths: string[], resourceType: ResourceType
 	return files;
 }
 
+export function resolveConfiguredResources(
+	entries: string[],
+	resourceType: ResourceType,
+	baseDir: string,
+	resolveEntry: (entry: string) => string,
+): Map<string, boolean> {
+	const rules = entries.map(parseResourceRule);
+	const sourcePaths = rules
+		.filter((rule) => rule.kind === "source" && !rule.isGlob)
+		.map((rule) => resolveEntry(rule.value));
+	const allPaths = resolveResourcePaths(sourcePaths, resourceType);
+	const selectionRules = rules.filter((rule) => rule.kind !== "source" || rule.isGlob);
+	const enabledPaths = selectResourcePaths(allPaths, selectionRules, baseDir);
+	return new Map(allPaths.map((path) => [path, enabledPaths.has(path)]));
+}
+
 /** Resolve one manifest resource array to the concrete files it selects. */
-export function resolveManifestResources(entries: string[], root: string, resourceType: ResourceType): string[] {
-	const sourceEntries = entries.filter((entry) => !isOverridePattern(entry));
-	const resolved = sourceEntries.flatMap((entry) => {
-		if (!hasGlobPattern(entry)) {
-			return [resolve(root, entry)];
+function resolveManifestResources(entries: string[], root: string, resourceType: ResourceType): string[] {
+	const rules = entries.map(parseResourceRule);
+	const resolved = rules.flatMap((rule) => {
+		if (rule.kind !== "source") {
+			return [];
 		}
-		return expandPackageGlob(entry, root);
+		if (rule.isGlob) {
+			return expandPackageGlob(rule.value, root);
+		}
+		return [resolve(root, rule.value)];
 	});
 	const allFiles = resolveResourcePaths(resolved, resourceType, root);
-	return Array.from(applyPatterns(allFiles, entries.filter(isOverridePattern), root));
+	return Array.from(
+		selectResourcePaths(
+			allFiles,
+			rules.filter((rule) => rule.kind !== "source"),
+			root,
+		),
+	);
+}
+
+function createPackageResourceMaps(): Record<ResourceType, Map<string, boolean>> {
+	return {
+		extensions: new Map(),
+		skills: new Map(),
+		prompts: new Map(),
+		themes: new Map(),
+	};
+}
+
+export function resolvePackageResources(
+	packageRoot: string,
+	filter?: PackageResourceFilter,
+): PackageResourceResolution {
+	const resources = createPackageResourceMaps();
+	const manifest = readPiManifest(join(packageRoot, "package.json"));
+	const resolveDefault = (resourceType: ResourceType): string[] => {
+		const entries = manifest?.[resourceType];
+		if (entries !== undefined) {
+			return resolveManifestResources(entries, packageRoot, resourceType);
+		}
+		const conventionDir = join(packageRoot, resourceType);
+		return existsSync(conventionDir)
+			? resolveResourcesInDirectory(conventionDir, resourceType, { recursive: true })
+			: [];
+	};
+
+	if (filter) {
+		for (const resourceType of RESOURCE_TYPES) {
+			const patterns = filter[resourceType];
+			if (filter.autoload === false) {
+				if (!patterns || patterns.length === 0) continue;
+				for (const [path, enabled] of resolveAutoloadDisabledResources(
+					resolveDefault(resourceType),
+					patterns,
+					packageRoot,
+				)) {
+					resources[resourceType].set(path, enabled);
+				}
+				continue;
+			}
+
+			const allPaths = resolveDefault(resourceType);
+			if (patterns === undefined) {
+				for (const path of allPaths) resources[resourceType].set(path, true);
+			} else if (patterns.length === 0) {
+				for (const path of allPaths) resources[resourceType].set(path, false);
+			} else {
+				for (const [path, enabled] of resolveResourceFilter(allPaths, patterns, packageRoot)) {
+					resources[resourceType].set(path, enabled);
+				}
+			}
+		}
+		return { handled: true, resources };
+	}
+
+	if (manifest) {
+		for (const resourceType of RESOURCE_TYPES) {
+			const entries = manifest[resourceType];
+			if (entries === undefined) continue;
+			for (const path of resolveManifestResources(entries, packageRoot, resourceType)) {
+				resources[resourceType].set(path, true);
+			}
+		}
+		return { handled: true, resources };
+	}
+
+	let handled = false;
+	for (const resourceType of RESOURCE_TYPES) {
+		const conventionDir = join(packageRoot, resourceType);
+		if (!existsSync(conventionDir)) continue;
+		handled = true;
+		for (const path of resolveResourcesInDirectory(conventionDir, resourceType, { recursive: true })) {
+			resources[resourceType].set(path, true);
+		}
+	}
+	return { handled, resources };
 }
