@@ -296,7 +296,7 @@ function discoverExtensionDirectoryContents(dir: string): string[] {
 	return entries;
 }
 
-function discoverExtensionResources(dir: string): string[] {
+export function discoverExtensionsInDir(dir: string): string[] {
 	if (!existsSync(dir)) return [];
 
 	const rootEntries = resolveExtensionEntries(dir);
@@ -314,7 +314,7 @@ export function resolveResourcesInDirectory(
 ): string[] {
 	switch (resourceType) {
 		case "extensions":
-			return discoverExtensionResources(dir);
+			return discoverExtensionsInDir(dir);
 		case "skills":
 			return discoverSkills(dir, options.skillMode ?? "pi");
 		case "prompts":
