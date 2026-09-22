@@ -820,7 +820,7 @@ pi.on("provider_stream_event", (event) => {
 });
 ```
 
-Handlers are awaited in stream order, so slow handlers delay stream consumption. Handler errors are reported as extension errors without changing the provider response. Support is adapter-specific. Currently `anthropic-messages`, `openai-completions`, and `openai-responses` emit this event. SDK-backed adapters can expose only fields retained by their SDK.
+Handlers are awaited in stream order, so slow handlers delay stream consumption. Handler errors are reported as extension errors without changing the provider response. Support is adapter-specific. Currently `anthropic-messages`, `openai-completions`, and `openai-responses` emit this event. SDK-backed adapters can expose only fields retained by their SDK. See [debug-provider.ts](../examples/extensions/debug-provider.ts) for an opt-in viewer that groups raw events by assistant message.
 
 #### cache_warming_decision
 
@@ -3067,6 +3067,7 @@ All examples in [examples/extensions/](../examples/extensions/).
 | `input-transform-streaming.ts` | Streaming-aware input transform | `on("input")`, `streamingBehavior` |
 | `model-status.ts` | React to model changes | `on("model_select")`, `setStatus` |
 | `provider-payload.ts` | Inspect payloads and provider response headers | `on("before_provider_request")`, `on("after_provider_response")` |
+| `debug-provider.ts` | Toggle and inspect raw provider stream events in TUI-only session entries | `on("provider_stream_event")`, `appendEntry`, `registerEntryRenderer` |
 | `system-prompt-header.ts` | Display system prompt info | `on("agent_start")`, `getSystemPrompt` |
 | `claude-rules.ts` | Load rules from files | `on("session_start")`, `on("before_agent_start")` |
 | `prompt-customizer.ts` | Add context-aware tool guidance using `systemPromptOptions` | `on("before_agent_start")`, `BuildSystemPromptOptions` |
