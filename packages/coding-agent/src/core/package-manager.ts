@@ -35,17 +35,14 @@ import { type PiManifest, readPiManifest } from "./pi-manifest.ts";
 import {
 	applyAutoloadDisabledPatterns,
 	applyPatterns,
-	collectAutoExtensionEntries,
-	collectAutoPromptEntries,
-	collectAutoSkillEntries,
-	collectAutoThemeEntries,
-	collectResourceFiles,
-	collectResourceFilesFromPaths,
+	discoverTopLevelResources,
 	isEnabledByOverrides,
 	type ResourceType,
-	resolveManifestResourceEntries,
+	resolveManifestResources,
+	resolveResourceDirectory,
+	resolveResourcePaths,
 	splitPatterns,
-} from "./resource-discovery.ts";
+} from "./resource-resolver.ts";
 import type { PackageSource, SettingsManager } from "./settings-manager.ts";
 
 const NETWORK_TIMEOUT_MS = 10000;
@@ -1636,8 +1633,8 @@ export class DefaultPackageManager implements PackageManager {
 		for (const resourceType of RESOURCE_TYPES) {
 			const dir = join(packageRoot, resourceType);
 			if (existsSync(dir)) {
-				// Collect all files from the directory (all enabled by default)
-				const files = collectResourceFiles(dir, resourceType);
+				// Resolve the convention directory (all resources enabled by default)
+				const files = resolveResourceDirectory(dir, resourceType);
 				for (const f of files) {
 					this.addResource(this.getTargetMap(accumulator, resourceType), f, metadata, true);
 				}
@@ -1661,8 +1658,8 @@ export class DefaultPackageManager implements PackageManager {
 		}
 		const dir = join(packageRoot, resourceType);
 		if (existsSync(dir)) {
-			// Collect all files from the directory (all enabled by default)
-			const files = collectResourceFiles(dir, resourceType);
+			// Resolve the convention directory (all resources enabled by default)
+			const files = resolveResourceDirectory(dir, resourceType);
 			for (const f of files) {
 				this.addResource(target, f, metadata, true);
 			}
@@ -1718,14 +1715,14 @@ export class DefaultPackageManager implements PackageManager {
 		const manifest = readPiManifest(join(packageRoot, "package.json"));
 		const entries = manifest?.[resourceType as keyof PiManifest];
 		if (entries !== undefined) {
-			return resolveManifestResourceEntries(entries, packageRoot, resourceType);
+			return resolveManifestResources(entries, packageRoot, resourceType);
 		}
 
 		const conventionDir = join(packageRoot, resourceType);
 		if (!existsSync(conventionDir)) {
 			return [];
 		}
-		return collectResourceFiles(conventionDir, resourceType);
+		return resolveResourceDirectory(conventionDir, resourceType);
 	}
 
 	private addManifestEntries(
@@ -1737,7 +1734,7 @@ export class DefaultPackageManager implements PackageManager {
 	): void {
 		if (!entries) return;
 
-		for (const file of resolveManifestResourceEntries(entries, root, resourceType)) {
+		for (const file of resolveManifestResources(entries, root, resourceType)) {
 			this.addResource(target, file, metadata, true);
 		}
 	}
@@ -1751,10 +1748,10 @@ export class DefaultPackageManager implements PackageManager {
 	): void {
 		if (entries.length === 0) return;
 
-		// Collect all files from plain entries (non-pattern entries)
+		// Resolve resources from plain entries (non-pattern entries)
 		const { plain, patterns } = splitPatterns(entries);
 		const resolvedPlain = plain.map((p) => this.resolvePathFromBase(p, baseDir));
-		const allFiles = collectResourceFilesFromPaths(resolvedPlain, resourceType);
+		const allFiles = resolveResourcePaths(resolvedPlain, resourceType);
 
 		// Determine which files are enabled based on patterns
 		const enabledPaths = applyPatterns(allFiles, patterns, baseDir);
@@ -1834,7 +1831,7 @@ export class DefaultPackageManager implements PackageManager {
 			// Project extensions from .pi/
 			addResources(
 				"extensions",
-				collectAutoExtensionEntries(projectDirs.extensions),
+				discoverTopLevelResources(projectDirs.extensions, "extensions"),
 				projectMetadata,
 				projectOverrides.extensions,
 				projectBaseDir,
@@ -1843,7 +1840,7 @@ export class DefaultPackageManager implements PackageManager {
 			// Project skills from .pi/
 			addResources(
 				"skills",
-				collectAutoSkillEntries(projectDirs.skills, "pi"),
+				discoverTopLevelResources(projectDirs.skills, "skills", "pi"),
 				projectMetadata,
 				projectOverrides.skills,
 				projectBaseDir,
@@ -1859,7 +1856,7 @@ export class DefaultPackageManager implements PackageManager {
 			};
 			addResources(
 				"skills",
-				collectAutoSkillEntries(agentsSkillsDir, "agents"),
+				discoverTopLevelResources(agentsSkillsDir, "skills", "agents"),
 				agentsMetadata,
 				projectOverrides.skills,
 				agentsBaseDir,
@@ -1869,14 +1866,14 @@ export class DefaultPackageManager implements PackageManager {
 		if (projectTrusted) {
 			addResources(
 				"prompts",
-				collectAutoPromptEntries(projectDirs.prompts),
+				discoverTopLevelResources(projectDirs.prompts, "prompts"),
 				projectMetadata,
 				projectOverrides.prompts,
 				projectBaseDir,
 			);
 			addResources(
 				"themes",
-				collectAutoThemeEntries(projectDirs.themes),
+				discoverTopLevelResources(projectDirs.themes, "themes"),
 				projectMetadata,
 				projectOverrides.themes,
 				projectBaseDir,
@@ -1886,7 +1883,7 @@ export class DefaultPackageManager implements PackageManager {
 		// User extensions from ~/.pi/agent/
 		addResources(
 			"extensions",
-			collectAutoExtensionEntries(userDirs.extensions),
+			discoverTopLevelResources(userDirs.extensions, "extensions"),
 			userMetadata,
 			userOverrides.extensions,
 			globalBaseDir,
@@ -1895,7 +1892,7 @@ export class DefaultPackageManager implements PackageManager {
 		// User skills from ~/.pi/agent/
 		addResources(
 			"skills",
-			collectAutoSkillEntries(userDirs.skills, "pi"),
+			discoverTopLevelResources(userDirs.skills, "skills", "pi"),
 			userMetadata,
 			userOverrides.skills,
 			globalBaseDir,
@@ -1909,7 +1906,7 @@ export class DefaultPackageManager implements PackageManager {
 		};
 		addResources(
 			"skills",
-			collectAutoSkillEntries(userAgentsSkillsDir, "agents"),
+			discoverTopLevelResources(userAgentsSkillsDir, "skills", "agents"),
 			userAgentsMetadata,
 			userOverrides.skills,
 			userAgentsBaseDir,
@@ -1917,14 +1914,14 @@ export class DefaultPackageManager implements PackageManager {
 
 		addResources(
 			"prompts",
-			collectAutoPromptEntries(userDirs.prompts),
+			discoverTopLevelResources(userDirs.prompts, "prompts"),
 			userMetadata,
 			userOverrides.prompts,
 			globalBaseDir,
 		);
 		addResources(
 			"themes",
-			collectAutoThemeEntries(userDirs.themes),
+			discoverTopLevelResources(userDirs.themes, "themes"),
 			userMetadata,
 			userOverrides.themes,
 			globalBaseDir,

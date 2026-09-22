@@ -113,7 +113,7 @@ export function splitPatterns(entries: string[]): { plain: string[]; patterns: s
 	return { plain, patterns };
 }
 
-function collectFiles(
+function discoverFilesRecursively(
 	dir: string,
 	filePattern: RegExp,
 	skipNodeModules = true,
@@ -152,7 +152,7 @@ function collectFiles(
 			if (ig.ignores(ignorePath)) continue;
 
 			if (isDir) {
-				files.push(...collectFiles(fullPath, filePattern, skipNodeModules, ig, root));
+				files.push(...discoverFilesRecursively(fullPath, filePattern, skipNodeModules, ig, root));
 			} else if (isFile && filePattern.test(entry.name)) {
 				files.push(fullPath);
 			}
@@ -164,7 +164,7 @@ function collectFiles(
 	return files;
 }
 
-function collectSkillEntries(
+function discoverSkills(
 	dir: string,
 	mode: SkillDiscoveryMode,
 	ignoreMatcher?: IgnoreMatcher,
@@ -234,7 +234,7 @@ function collectSkillEntries(
 			if (!isDir) continue;
 			if (ig.ignores(`${relPath}/`)) continue;
 
-			entries.push(...collectSkillEntries(fullPath, mode, ig, root));
+			entries.push(...discoverSkills(fullPath, mode, ig, root));
 		}
 	} catch {
 		// Ignore errors
@@ -243,11 +243,7 @@ function collectSkillEntries(
 	return entries;
 }
 
-export function collectAutoSkillEntries(dir: string, mode: SkillDiscoveryMode): string[] {
-	return collectSkillEntries(dir, mode);
-}
-
-export function collectAutoPromptEntries(dir: string): string[] {
+function discoverTopLevelPromptResources(dir: string): string[] {
 	const entries: string[] = [];
 	if (!existsSync(dir)) return entries;
 
@@ -284,7 +280,7 @@ export function collectAutoPromptEntries(dir: string): string[] {
 	return entries;
 }
 
-export function collectAutoThemeEntries(dir: string): string[] {
+function discoverTopLevelThemeResources(dir: string): string[] {
 	const entries: string[] = [];
 	if (!existsSync(dir)) return entries;
 
@@ -324,7 +320,7 @@ export function collectAutoThemeEntries(dir: string): string[] {
 function resolveExtensionEntries(dir: string): string[] | null {
 	const manifest = readPiManifest(join(dir, "package.json"));
 	if (manifest?.extensions !== undefined) {
-		return resolveManifestResourceEntries(manifest.extensions, dir, "extensions");
+		return resolveManifestResources(manifest.extensions, dir, "extensions");
 	}
 
 	const indexTs = join(dir, "index.ts");
@@ -339,7 +335,7 @@ function resolveExtensionEntries(dir: string): string[] | null {
 	return null;
 }
 
-function collectExtensionDirectoryContents(dir: string): string[] {
+function discoverExtensionDirectoryContents(dir: string): string[] {
 	const entries: string[] = [];
 	const ig = ignore();
 	addIgnoreRules(ig, dir, dir);
@@ -384,7 +380,7 @@ function collectExtensionDirectoryContents(dir: string): string[] {
 	return entries;
 }
 
-export function collectAutoExtensionEntries(dir: string): string[] {
+function discoverExtensionResources(dir: string): string[] {
 	if (!existsSync(dir)) return [];
 
 	const rootEntries = resolveExtensionEntries(dir);
@@ -392,18 +388,36 @@ export function collectAutoExtensionEntries(dir: string): string[] {
 		return rootEntries;
 	}
 
-	return collectExtensionDirectoryContents(dir);
+	return discoverExtensionDirectoryContents(dir);
 }
 
-/** Collect resource files from a directory using the resource type's discovery rules. */
-export function collectResourceFiles(dir: string, resourceType: ResourceType): string[] {
+/** Resolve a directory entry using the resource type's package convention. */
+export function resolveResourceDirectory(dir: string, resourceType: ResourceType): string[] {
 	if (resourceType === "skills") {
-		return collectSkillEntries(dir, "pi");
+		return discoverSkills(dir, "pi");
 	}
 	if (resourceType === "extensions") {
-		return collectAutoExtensionEntries(dir);
+		return discoverExtensionResources(dir);
 	}
-	return collectFiles(dir, FILE_PATTERNS[resourceType]);
+	return discoverFilesRecursively(dir, FILE_PATTERNS[resourceType]);
+}
+
+/** Discover resources from a coding-agent configuration directory. */
+export function discoverTopLevelResources(
+	dir: string,
+	resourceType: ResourceType,
+	skillMode: SkillDiscoveryMode = "pi",
+): string[] {
+	if (resourceType === "skills") {
+		return discoverSkills(dir, skillMode);
+	}
+	if (resourceType === "extensions") {
+		return discoverExtensionResources(dir);
+	}
+	if (resourceType === "prompts") {
+		return discoverTopLevelPromptResources(dir);
+	}
+	return discoverTopLevelThemeResources(dir);
 }
 
 function matchesAnyPattern(filePath: string, patterns: string[], baseDir: string): boolean {
@@ -543,11 +557,7 @@ export function applyAutoloadDisabledPatterns(
 	return result;
 }
 
-export function collectResourceFilesFromPaths(
-	paths: string[],
-	resourceType: ResourceType,
-	manifestRoot?: string,
-): string[] {
+export function resolveResourcePaths(paths: string[], resourceType: ResourceType, manifestRoot?: string): string[] {
 	const files: string[] = [];
 	const resolvedManifestRoot = manifestRoot ? resolve(manifestRoot) : undefined;
 	for (const path of paths) {
@@ -559,9 +569,9 @@ export function collectResourceFilesFromPaths(
 				files.push(path);
 			} else if (stats.isDirectory()) {
 				if (resourceType === "extensions" && resolvedManifestRoot === resolve(path)) {
-					files.push(...collectExtensionDirectoryContents(path));
+					files.push(...discoverExtensionDirectoryContents(path));
 				} else {
-					files.push(...collectResourceFiles(path, resourceType));
+					files.push(...resolveResourceDirectory(path, resourceType));
 				}
 			}
 		} catch {
@@ -572,7 +582,7 @@ export function collectResourceFilesFromPaths(
 }
 
 /** Resolve one manifest resource array to the concrete files it selects. */
-export function resolveManifestResourceEntries(entries: string[], root: string, resourceType: ResourceType): string[] {
+export function resolveManifestResources(entries: string[], root: string, resourceType: ResourceType): string[] {
 	const sourceEntries = entries.filter((entry) => !isOverridePattern(entry));
 	const resolved = sourceEntries.flatMap((entry) => {
 		if (!hasGlobPattern(entry)) {
@@ -580,6 +590,6 @@ export function resolveManifestResourceEntries(entries: string[], root: string, 
 		}
 		return expandPackageGlob(entry, root);
 	});
-	const allFiles = collectResourceFilesFromPaths(resolved, resourceType, root);
+	const allFiles = resolveResourcePaths(resolved, resourceType, root);
 	return Array.from(applyPatterns(allFiles, entries.filter(isOverridePattern), root));
 }
