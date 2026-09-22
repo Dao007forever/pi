@@ -299,6 +299,7 @@ user sends prompt ────────────────────�
   │   ├─► before_provider_headers (can mutate headers)     |
   │   ├─► before_provider_request (can inspect or replace payload)
   │   ├─► after_provider_response (status + headers, before stream consume)
+  │   ├─► provider_stream_event (parsed provider stream events, when supported)
   │   │                                            │       │
   │   │   LLM responds, may call tools:            │       │
   │   │     ├─► tool_execution_start               │       │
@@ -801,6 +802,25 @@ pi.on("after_provider_response", (event, ctx) => {
 ```
 
 Header availability depends on provider and transport. Providers that abstract HTTP responses may not expose headers.
+
+#### provider_stream_event
+
+Fired for each parsed provider stream event before Pi normalizes it. `event.data` is the earliest structured value available to Pi, not necessarily the original HTTP bytes or SSE frame. Treat it as read-only because mutations can affect normalization. The event is notification-only and is not persisted in the session.
+
+```typescript
+pi.on("provider_stream_event", (event) => {
+  // event.provider, event.api, event.model
+  // event.data - provider/API-specific parsed event
+  if (event.provider !== "openrouter") return;
+
+  const chunk = event.data as Record<string, unknown>;
+  if (chunk.openrouter_metadata) {
+    console.log(chunk.openrouter_metadata);
+  }
+});
+```
+
+Handlers are awaited in stream order, so slow handlers delay stream consumption. Handler errors are reported as extension errors without changing the provider response. Support is adapter-specific. Currently `anthropic-messages`, `openai-completions`, and `openai-responses` emit this event. SDK-backed adapters can expose only fields retained by their SDK.
 
 #### cache_warming_decision
 

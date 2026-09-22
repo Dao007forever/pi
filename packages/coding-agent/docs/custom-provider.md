@@ -457,6 +457,8 @@ function streamMyProvider(
       stream.push({ type: "start", partial: output });
 
       // Make API request and process response...
+      // Before normalizing each parsed provider event:
+      // await options?.onProviderStreamEvent?.(providerEvent, model);
       // Push content events as they arrive and set stopReason from the terminal event.
       if (output.stopReason === "pending") {
         throw new Error("Provider stream ended without a stop reason");
